@@ -1,0 +1,547 @@
+# -*- coding: utf-8 -*-
+"""
+This script analyses EEG data from a digit-span working memory task.
+Participants listened to sequences of digits (5, 9, or 13 digits long) and
+were later asked to recall them. Each digit presentation was labelled as either
+"control" (passive listening) or "memory" (active memorisation of the digits).
+
+The main goal is to examine fronto-parietal theta-band connectivity during
+memory encoding. Specifically, we use the debiased weighted Phase Lag Index 
+(wPLI) to quantify phase synchronisation between frontal and parietal 
+electrodes in the 4–8 Hz (theta) band.
+
+This script has two parts:
+
+Part 1: preprocessing (run once per subject, manually)
+    Loads raw EEG data, filters, runs ICA etc. For each data file, it saves 
+    'cleaned.fif' files to the destination folder.
+
+Part 2: connectivity analysis 
+      Loads the "cleaned .fif" files, computes fronto-parietal theta wPLI for
+    each trial, and saves it in a CSV file.
+"""
+
+# Imports
+#--------
+
+import re
+import glob
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import mne
+import os
+
+from scipy.signal import hilbert
+
+
+# Analysis settings
+#-------------------
+
+## Determine frequencies
+# Theta band
+THETA_LOW = 4
+THETA_HIGH = 8
+
+## Determine time window (after digit onset) (in seconds)
+WINDOW_START = 0.3
+WINDOW_END = 2.0     
+
+## Determine ROI's
+# Electrodes of interest
+FRONTAL_CHANNELS = ['Fz', 'F1', 'F2']
+PARIETAL_CHANNELS = ['Pz', 'P1', 'P2']
+
+# Working directory: "source" contains all raw files, "save" is where processed files are stored
+folder_source = "C:/Users/32488/OneDrive/Documents/2de Ma Experimental Psychology/RPN/Case_Studies_Raw_Files/"
+folder_save = "C:/Users/32488/OneDrive/Documents/2de Ma Experimental Psychology/RPN/Case_Studies_Processed/"
+
+
+# Label parsing helper function
+#------------------------------
+#
+# Extract information encoded in the trial labels:
+# (Example: "memory 01/13 correct: memorize digit 1 (first) in 13 digit sequence")
+#   - digit position within the sequence (01, 02...)
+#   - total sequence length (05, 09, 13)
+#   - recall outcome ("correct" or "error")
+#------------------------------------------
+
+def parse_label(label):
+    """
+    Extract position, sequence length, and outcome from a memory trial label.
+
+    Parameters:
+    ----------
+    label (str): Trial label string from the events file.
+
+    Returns:
+    -------
+    position (int): serial position of the digit
+    seq_length (int) sequence length
+    outcome (str): "correct" or "error"
+    """
+    match = re.match(r"(memory|control) (\d+)/(\d+)(?:\s(\w+))?:", label)
+
+    if match is None:
+        raise ValueError(f"Label did not match format: {label}")
+
+    condition  = match.group(1)           
+    position   = int(match.group(2))
+    seq_length = int(match.group(3))
+    outcome    = match.group(4) or "n/a"  # control trials have no outcome
+
+    return condition, position, seq_length, outcome
+
+
+
+# Debiased wPLI function
+#-----------------------
+
+def debiased_wpli(signal1, signal2):
+    """
+    Compute debiased wPLI between two analytic signals
+
+    Parameters:
+    ----------
+    signal1, signal2 (np.ndarray): Analytic signals for two electrodes over a time window.
+
+    Returns :
+    -------
+    debiased wPLI (float) or np.nan
+    """
+
+    phase1 = signal1 / np.abs(signal1)
+    phase2 = signal2 / np.abs(signal2)
+
+    imag_values = np.imag(
+        phase1 * np.conj(phase2)
+    )
+
+    num = (
+        np.sum(imag_values) ** 2
+        - np.sum(imag_values ** 2)
+    )
+
+    den = (
+        np.sum(np.abs(imag_values)) ** 2
+        - np.sum(imag_values ** 2)
+    )
+
+    if den == 0:
+        return np.nan
+
+    return num / den
+
+
+#########################
+# Part 1: Pre-processing
+########################
+#
+#   1. Load raw data
+#   2. Filter (bandpass)
+#   3. Interpolate bad channels
+#   4. Average reference
+#   5. Create epochs
+#   6. Visual epoch rejection
+#   7. ICA on the epochs to remove eye blink components
+#   8. Apply ICA and save cleaned data
+#
+#---------------------------------
+
+subject_id  = "sub-097" #which subject you're currently processing
+
+eeg_file    = os.path.join(folder_source, f"{subject_id}_task-memory_eeg.set")
+events_file = os.path.join(folder_source, f"{subject_id}_task-memory_events.txt")
+clean_file  = os.path.join(folder_save, f"{subject_id}_clean-epo.fif")
+
+
+# 1) Load raw data
+#--------------
+
+raw = mne.io.read_raw_eeglab(eeg_file, preload=True, verbose=False)
+original_sfreq = raw.info['sfreq']
+
+
+# Apply 'standard_1020' montage
+montage = mne.channels.make_standard_montage('standard_1020') # get spatial positions of the electrodes
+raw.set_montage(montage, on_missing='warn')
+
+# Check data and channels
+print(raw.info) #a full report
+print(raw.info['ch_names'])
+
+# 2) Filter the data
+#----------------
+
+# Broadband bandpass filter
+#---------------------------
+raw.filter(1, 40)
+raw.resample(250) #lower SR so ICA does not take 3 hours
+
+# 3) Bad channel interpolation
+#------------------------------
+
+# Plot the filtered data as a butterfly plot to quickly detect bad channels
+raw.plot(butterfly = True)
+
+# Plot the filtered data for each channel separately and click on bad
+# channels to remove them
+raw.plot()
+
+# Interpolate the marked channels 
+raw.interpolate_bads(reset_bads=False)
+
+
+# 4) Average reference
+#----------------------
+raw.set_eeg_reference('average', verbose=False) # Re-references each channel to the average of all selected electrodes
+print(raw.info) #check report
+
+
+# 5) Create epochs around digit onsets
+#-------------------------------------------
+# We epoch the data around each digit presentation (from WINDOW_START to WINDOW_END)
+# We include a 0.3 s pre-window as baseline for visual inspection 
+
+
+# Load the events table
+events_table = pd.read_csv(events_file, sep="\t")
+
+# Select memory and control events
+memory_events = events_table[
+    events_table["trial_type"].str.contains("memory|control")
+]
+
+# Build MNE-format events array: (n_events, 3) with columns [sample, 0, event_id]
+event_samples = (
+    memory_events["sample"].values
+    * raw.info['sfreq']
+    / original_sfreq
+).astype(int)
+
+mne_events = np.column_stack([
+    event_samples,
+    np.zeros(len(event_samples), dtype=int),
+    np.ones(len(event_samples), dtype=int)
+])
+
+# Create epochs
+# tmin=-0.3 
+# tmax=2.0 
+
+epochs = mne.Epochs(
+    raw,
+    mne_events,
+    event_id   = 1,
+    tmin       = -0.3,
+    tmax       = 2.0,
+    baseline   = None,    
+    preload    = True,
+    reject     = None     
+)
+
+print(f"Created {len(epochs)} epochs")
+
+
+# 6) Visual epoch rejection
+#---------------------------
+# Click on bad epochs to remove them
+
+epochs.plot(n_epochs=5, n_channels=64, events=True)
+print(set(raw.ch_names) - set(epochs.ch_names))
+
+
+print("Epochs remaining after visual rejection:", len(epochs))
+
+
+# 7) ICA
+#--------
+# Number of components = n_channels - n_interpolated - 1
+
+
+n_interpolated = len(raw.info['bads'])
+ 
+ncomp = len(epochs.pick('eeg').ch_names) - len(raw.info['bads']) - 1
+print(f"Number of ICA components: {ncomp}")
+
+# Create ICA object
+ica = mne.preprocessing.ICA(n_components=ncomp, method = 'picard', random_state=42, max_iter='auto')
+
+# Fit ICA on cleaned epochs
+ica.fit(epochs)
+
+# Plot components as scalp topographies: click on eye-blink component to remove it
+ica.plot_components()
+
+# Inspect individual components to check whether eye-blinks are isolated
+ica.plot_sources(raw)
+
+# Plot the properties of individual components to check
+ica.plot_properties(epochs, picks=0)
+
+# Show overlay: what the data looks like before and after ICA removal
+ica.plot_overlay(epochs.average())
+
+
+# Apply ICA and save clean epochs
+#----------------------------------
+# apply the ICA weights to remove them from the data
+
+clean_epochs = epochs.copy()
+ica.apply(clean_epochs)
+
+# Save the clean epochs as ".fif" file
+clean_epochs.save(clean_file, overwrite=True)
+print(f"Saved clean epochs: {clean_file}")
+
+
+##################################
+# PART 2 — CONNECTIVITY ANALYSIS
+##################################
+#
+# Loads the cleaned ".fif" files of all subjects saved in Part 1 and computes
+# fronto-parietal theta wPLI from the cleaned epochs
+#
+# Channel index:
+# Hardcoded channel indices:
+#   index 0 = Fz, 1 = F1, 2 = F2, 3 = Pz, 4 = P1, 5 = P2
+#-------------------------------------------------------
+
+def process_subject(subject_id, folder_source, folder_save):
+    """
+    Run connectivity analysis for one subject
+
+    Parameters:
+    -----------
+    subject_id (str)
+    folder_source (str): path to folder containing cleaned subject files
+    folder_save (str) path to folder where new files are saved
+
+    Returns:
+    ---------
+    pd.DataFrame with columns: subject, trial_index, position, seq_length, outcome, wpli
+    Or None if files are missing.
+    """
+
+    print(f"\n{'='*60}")
+    print(f"Processing {subject_id}")
+    print(f"{'='*60}")
+
+    # File paths
+    #-----------
+
+    clean_file  = os.path.join(folder_save, f"{subject_id}_clean-epo.fif")
+    events_file = os.path.join(folder_source, f"{subject_id}_task-memory_events.txt")
+    output_csv  = os.path.join(folder_save, f"{subject_id}_wpli.csv")
+
+    # Check files exist
+    if not os.path.exists(clean_file):
+        print(f"  WARNING: Clean epochs file not found for {subject_id}.")
+        print(f"  Run Part 1 first to generate: {clean_file}")
+        return None
+
+    if not os.path.exists(events_file):
+        print(f"  WARNING: Events file not found for {subject_id}, skipping.")
+        return None
+
+    # Skip if already processed
+    #---------------------------
+    # Load subject's CSV id it already exists from a previous run
+
+    if os.path.exists(output_csv):
+        print(f"  CSV already exists {output_csv}")
+        return pd.read_csv(output_csv)
+
+    # Load clean epochs
+    #-------------------
+
+    clean_epochs = mne.read_epochs(clean_file, preload=True, verbose=False)
+    sfreq = clean_epochs.info['sfreq']
+
+
+    # Select channels of interest
+    #--------------------------------
+
+    clean_epochs.pick(['Fz', 'F1', 'F2', 'Pz', 'P1', 'P2'])
+
+
+    # Channel indices 
+    #------------------
+    # Making sure that missing channels do not pose a problem 
+
+    available_channels = clean_epochs.ch_names
+
+    frontal_idx  = [available_channels.index(ch) for ch in FRONTAL_CHANNELS
+                if ch in available_channels]
+    parietal_idx = [available_channels.index(ch) for ch in PARIETAL_CHANNELS
+                if ch in available_channels]
+
+    missing = [ch for ch in FRONTAL_CHANNELS + PARIETAL_CHANNELS 
+           if ch not in available_channels]
+    if missing:
+        print(f" Missing channels for {subject_id}: {missing}. wPLI based on {len(frontal_idx)*len(parietal_idx)} pairs instead of 9")
+
+
+    # Load events table
+    #-------------------------
+
+    # Import events table (txt file). Contains timing and labels for each digit presentation.
+    events_table = pd.read_csv(events_file, sep="\t")
+
+    # Only keep memory events
+    memory_events = events_table[
+        events_table["trial_type"].str.contains("memory|control")
+    ]
+
+    event_labels = memory_events["trial_type"].values
+
+
+    # Extract epoch data
+    #-----------------------
+    # Extract the data as a 3D array: (n_epochs, n_channels, n_times)
+
+    epoch_data = clean_epochs.get_data()  # shape: (n_epochs, 6, n_times)
+    epoch_tmin    = clean_epochs.tmin
+    window_start  = int((WINDOW_START - epoch_tmin) * sfreq)
+    window_end    = int((WINDOW_END   - epoch_tmin) * sfreq)
+
+
+    # Apply theta filter
+    #------------------
+
+    theta_data = mne.filter.filter_data(
+        epoch_data.reshape(-1, epoch_data.shape[-1]),
+        sfreq   = sfreq,
+        l_freq  = THETA_LOW,
+        h_freq  = THETA_HIGH,
+        verbose = False
+    ).reshape(epoch_data.shape)   #reshape to (n_epochs, n_channels, n_times)
+
+    # Apply Hilbert transform
+    # ----------------------------------------------------------
+
+    # converts the real-valued theta signal into a complex-valued analytical signal
+
+    analytic_signal = hilbert(theta_data, axis=-1)
+    #shape= (n_epochs, 6, n_times)
+
+    # Compute connectivity
+    #------------------------
+    #
+    #   1. Slice the analysis window [0.3 s, 2.0 s] within the epoch
+    #   2. Compute debiased wPLI for every frontal–parietal electrode pair: (3 x 3) connectivity matrix.
+    #   3. Store one row per trial in the output dataframe.
+    #----------------------------------------------------
+
+    rows = []
+
+    n_epochs_available = analytic_signal.shape[0]
+
+    for idx in range(n_epochs_available):
+
+        # Check we have a matching label for this epoch
+        if idx >= len(event_labels):
+            print(f"  Skipping epoch {idx+1}: no matching event label")
+            continue
+
+        # Extract trial metadata from the label
+        condition, position, seq_length, outcome = parse_label(event_labels[idx])
+
+
+        # Extract analysis window within epoch 
+        segment = analytic_signal[idx, :, window_start:window_end]
+        # shape: (6, n_window_samples)
+
+        # Connectivity matrix 
+        # Shape: (n_frontal_available, n_parietal_available) — varies if channels are missing
+        # Each cell [i, j] holds the wPLI between frontal electrode i
+        # and parietal electrode j.
+        connectivity_matrix = np.full(
+            (len(frontal_idx), len(parietal_idx)), np.nan
+        )
+
+
+        # Compute fronto-parietal wPLI 
+        for i, f_idx in enumerate(frontal_idx):
+            for j, p_idx in enumerate(parietal_idx):
+
+                sig1 = segment[f_idx]
+                sig2 = segment[p_idx]
+
+                connectivity_matrix[i, j] = debiased_wpli(sig1, sig2)
+
+        # Store one row per trial 
+        # Mean over all 9 frontal–parietal electrode pairs gives a single wPLI value that 
+        # represents fronto-parietal connectivity for current trial
+
+        rows.append({
+            "subject"     : subject_id,
+            "trial_index" : idx,
+            "position"    : position,
+            "condition"   : condition,
+            "seq_length"  : seq_length,
+            "outcome"     : outcome,
+            "wpli"        : np.nanmean(connectivity_matrix)
+        })
+
+        if (idx + 1) % 20 == 0:
+            print(f"  Processed {idx+1}/{n_epochs_available} trials")
+
+
+    # Save CSV for each subject
+    #---------------------------------
+
+    subject_df = pd.DataFrame(rows)
+    subject_df.to_csv(output_csv, index=False)
+    print(f"  Saved: {output_csv}")
+
+    return subject_df
+
+
+
+# Multi-subject loop
+#----------------------
+#
+# Find all cleaned epoch files in the working directory, extract subject IDs, and run the connectivity analysis
+# The master CSV is built by combining all individual CSV's
+#-------------------------------------------------
+
+# Find all cleaned epoch files
+clean_files = glob.glob(os.path.join(folder_save, "sub-*_clean-epo.fif"))
+
+# Extract subject IDs
+subject_ids = sorted([
+    os.path.basename(f).split("_clean-epo")[0]
+    for f in clean_files
+])
+
+print(f"Found {len(subject_ids)} preprocessed subjects: {subject_ids}")
+
+# Run connectivity pipeline for each subject
+all_subject_dfs = []
+
+for subject_id in subject_ids:
+
+    subject_df = process_subject(subject_id, folder_source, folder_save)
+
+    if subject_df is not None and len(subject_df) > 0:
+        all_subject_dfs.append(subject_df)
+    else:
+        print(f"  No data returned for {subject_id}, skipping.")
+
+
+# Combine into master csv
+#------------------------
+
+master_df = pd.concat(all_subject_dfs, ignore_index=True)
+
+master_df.to_csv(
+    os.path.join(folder_save, "wpli_master_dataframe.csv"),
+    index=False
+)
+
+print(f"\nDone. Master dataframe saved: wpli_master_dataframe.csv")
+print(f"Shape: {master_df.shape}")
+print(master_df.tail(10))
+
