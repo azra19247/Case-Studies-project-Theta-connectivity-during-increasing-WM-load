@@ -303,9 +303,6 @@ print(f"Saved clean epochs: {clean_file}")
 # Loads the cleaned ".fif" files of all subjects saved in Part 1 and computes
 # fronto-parietal theta wPLI from the cleaned epochs
 #
-# Channel index:
-# Hardcoded channel indices:
-#   index 0 = Fz, 1 = F1, 2 = F2, 3 = Pz, 4 = P1, 5 = P2
 #-------------------------------------------------------
 
 def process_subject(subject_id, folder_source, folder_save):
@@ -368,7 +365,7 @@ def process_subject(subject_id, folder_source, folder_save):
 
     # Channel indices 
     #------------------
-    # Making sure that missing channels do not pose a problem 
+    # Flexible channel indices making sure that missing channels do not pose a problem 
 
     available_channels = clean_epochs.ch_names
 
