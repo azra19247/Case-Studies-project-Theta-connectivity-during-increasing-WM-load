@@ -1,0 +1,171 @@
+#===========================================
+#STEP 1: PREPARATION
+#===========================================
+
+#1. load packages
+library(lme4)
+library(lmerTest)
+library(ggplot2)
+library(dplyr)
+library(car)
+
+#2. Load your data
+df <- read.csv("/Users/miralombaert/Desktop/master2/casestudies/wpli_master_dataframe.csv")
+head(df)
+str(df)
+
+#3. set breakpoint
+
+  #Plot as a Grouped Bar Chart (Raw Counts): this figure shows the count of errors versus the count of correct retrievals
+  #this way we can use a data-based approach to choose the best break point: 
+
+ggplot(df[df$condition == "memory", ], aes(x = factor(position), fill = outcome)) +
+  geom_bar(position = "dodge") +
+  labs(
+    title = "Outcome Counts by Position",
+    x = "Position",
+    y = "Count",
+    fill = "Outcome"
+  ) +
+  theme_minimal()
+
+  #set break point, data justified: 
+  #for the data justification, we will look at the plot and take the BP
+  #where the correct count first dropped below the error count
+BP <- 6 
+
+#4.piecewise predictors
+
+#define two re-parametrized predictors and add to the dataframe: together they create a hinge at the BP
+  # Load 1: increases from 1 to BP, then stays flat
+df$load1 <- ifelse(df$position <= BP, df$position, BP)
+  # Load 2: 0 before BP, then increases after the BP
+df$load2 <- ifelse(df$position > BP, df$position - BP, 0)
+
+# Check how this looks in the dataframe
+head(df,13)
+
+
+#=============================================================
+# STEP 2: EXPLORATORY VISUALIZATION: look if the data is similar 
+# to what we expected theoretically
+#=============================================================
+
+# Scatterplot of wPLI across serial position, grouped per subject, also showing an individual line
+# per subject(in other colors) and a grand average line for all subjects (in black) 
+
+ggplot(df[df$condition == "memory", ], aes(x = position, y = wpli, group = subject)) +
+  geom_jitter(alpha = 0.3, color = "steelblue", width = 0.2) +
+  geom_smooth(data = filter(df, position <= BP), 
+              method = "lm", color = "darkred") +
+  geom_smooth(data = filter(df, position > BP), 
+              method = "lm", color = "darkgreen") +
+  # grand mean split at BP — two separate black lines
+  geom_smooth(data = filter(df, position <= BP),
+              aes(group = 1), method = "lm",
+              color = "black", linewidth = 1.2, se = TRUE) +
+  geom_smooth(data = filter(df, position > BP),
+              aes(group = 1), method = "lm",
+              color = "black", linewidth = 1.2, se = TRUE) +
+  geom_vline(xintercept = BP, linetype = "dashed", color = "grey40") +
+  geom_vline(xintercept = BP+1, linetype = "dashed", color = "grey40") +
+  scale_x_continuous(breaks = 1:13) +
+  labs(title = "wPLI across serial position by subject",
+       x     = "Serial position (load)",
+       y     = "Fronto-parietal theta wPLI",
+       color = "Subject") +
+  theme_minimal()
+
+#=============================================================
+# STEP 3: MODEL SPECIFICATION AND FITTING
+#=============================================================
+
+  #1) a regular LMM: expected that this will fail assumption checks due to the strict positive skew
+  # of wpli data
+
+model_active <- lmer(wpli ~ load1 + load2 + (1|subject), data = df[df$condition == "memory", ])
+library(performance)
+library(ggplot2)
+    #check assumptions:
+diagnostics_active <- check_model(model_active)
+my_plots <- plot(diagnostics_active, panel = FALSE) #the assumptions are not great...
+my_plots[[1]]
+my_plots[[2]]
+my_plots[[3]]
+my_plots[[4]]
+my_plots[[5]]
+my_plots[[6]]
+my_plots[[7]]
+
+#not ideal!
+
+  #2) new model: gamma distributed GLMM with a log link function 
+        #this model does not assume heterogeneity of variance 
+        #this model explicitly wants right skewed/positively skewed data
+model_active_glmm <- glmer(wpli ~ load1 + load2 + (1|subject), 
+                           data = df[df$condition == "memory", ],
+                           family = Gamma(link = "log")) #got an error bcs there are some minor negative values!
+
+        # Shift by 0.003 to ensure the minimum value becomes strictly positive (~0.00035), 
+        # normally the wpli should be strictly positive anyways (theoretically), but probably due to some previous
+        # processing steps certain very low wpli's became negative due to subtractions, that's why we add this value
+        # to make sure everything is positive, as this is a strict rule of GLMMs with log link function
+
+min(df$wpli[df$condition == "memory"], na.rm = TRUE) #figure out what is the most negative value in the dataset
+model_active_glmm <- glmer(wpli + 0.003 ~ load1 + load2 + (1|subject),  #add this value to all wpli's 
+                         data = df[df$condition == "memory", ], 
+                         family = Gamma(link = "log"))
+
+        #check assumptions of this model:
+
+            #Grab fitted values and residuals from your GLMM
+df_diag <- df %>%
+  filter(condition == "memory") %>%
+  mutate(
+    Fitted = predict(model_active_glmm, type = "link"), # Linear predictor scale
+    Residuals = residuals(model_active_glmm, type = "deviance") # Deviance residuals for GLMM
+  )
+head(df_diag)
+
+            #Linearity and Homogeneity Plot combined
+ggplot(df_diag, aes(x = Fitted, y = Residuals)) +
+  geom_jitter(alpha = 0.1, color = "steelblue", width = 0.01) +
+  geom_smooth(method = "gam", color = "darkred", se = FALSE) +  # GAM is safe for large data
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  labs(
+    title = "Residuals vs Fitted Values",
+    x = "Linear Predictor (Fitted Values)",
+    y = "Deviance Residuals"
+  ) +
+  theme_minimal()
+
+              # QQ-Plot of Residuals
+ggplot(df_diag, aes(sample = Residuals)) +
+  stat_qq(alpha = 0.2, color = "steelblue") +
+  stat_qq_line(color = "darkgreen", linewidth = 1) +
+  labs(
+    title = "Normal Q-Q Plot",
+    x = "Theoretical Quantiles",
+    y = "Sample Quantiles (Residuals)"
+  ) +
+  theme_minimal()
+
+#= this model has a substantially improved fit! so we can continue with this model
+
+summary(model_active_glmm)
+
+
+#=============================================================
+# STEP 4: hypothesis testing
+#=============================================================
+
+# test both hypothesis 1 and 2 at the same time with a bonferroni correction
+library(multcomp)
+
+  # define both hypotheses: 
+load_effects <- glht(model_active_glmm, linfct = c("load1 = 0", "load1 + load2 = 0"))
+summary(load_effects, test= adjusted("bonferroni")) #inspect the results
+
+
+
+
