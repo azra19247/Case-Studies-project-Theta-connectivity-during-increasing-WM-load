@@ -1,6 +1,33 @@
-#===========================================
+#=============================================================
+#STEP 0: PARTICIPANT INFORMATION
+#=============================================================
+library(dplyr)
+library(tidyr)
+
+participant_info <- read.delim("/Users/miralombaert/Desktop/master2/casestudies/participants.tsv")
+participant_info <- participant_info[participant_info$EEG_excluded == "no",]
+
+# compute mean, sd and range of age:
+
+age_stats <- participant_info %>%
+  summarise(
+    variable = "age",
+    statistics = c("Mean", "SD", "Min", "Max"),
+    value = c(mean(age, na.rm = TRUE), 
+               sd(age, na.rm = TRUE), 
+               min(age, na.rm = TRUE), 
+               max(age, na.rm = TRUE))
+  )
+
+#compute number of males, females: 
+gender_stats <- participant_info %>%
+  count(sex) %>%
+  rename(Variable = sex, value = n) %>%
+  mutate(Statistic = "Count", Variable = as.character(Variable))
+
+#=============================================================
 #STEP 1: PREPARATION
-#===========================================
+#=============================================================
 
 #1. load packages
 library(lme4)
@@ -45,9 +72,44 @@ df$load2 <- ifelse(df$position > BP, df$position - BP, 0)
 # Check how this looks in the dataframe
 head(df,13)
 
+#=============================================================
+# STEP 2: descriptive stats
+#=============================================================
+
+desc_position <- df %>%
+  filter(condition == "memory") %>%
+  group_by(position) %>%
+  summarise(
+    N = n(),
+    Mean_wPLI = mean(wpli, na.rm = TRUE),
+    SD_wPLI = sd(wpli, na.rm = TRUE),
+    Median_wPLI = median(wpli, na.rm = TRUE),
+    IQR = IQR(wpli, na.rm = TRUE),
+    Min = min(wpli, na.rm = TRUE),
+    Max = max(wpli, na.rm = TRUE)
+  )
+
+desc_position
+
+desc_position_round <- desc_position %>%
+  mutate(
+    Mean_wPLI = round(Mean_wPLI, 3),
+    SD_wPLI = round(SD_wPLI, 3),
+    Median_wPLI = round(Median_wPLI, 3),
+    IQR = round(IQR, na.rm = TRUE),
+    Min = round(Min, 3),
+    Max = round(Max, 3)
+  )
+
+desc_position_round
+
+write.csv(desc_position_round,
+          "descriptive_statistics_wPLI.csv",
+          row.names = FALSE)
+
 
 #=============================================================
-# STEP 2: EXPLORATORY VISUALIZATION: look if the data is similar 
+# STEP 3: EXPLORATORY VISUALIZATION: look if the data is similar 
 # to what we expected theoretically
 #=============================================================
 
@@ -77,7 +139,7 @@ ggplot(df[df$condition == "memory", ], aes(x = position, y = wpli, group = subje
   theme_minimal()
 
 #=============================================================
-# STEP 3: MODEL SPECIFICATION AND FITTING
+# STEP 4: MODEL SPECIFICATION AND FITTING
 #=============================================================
 
   #1) a regular LMM: expected that this will fail assumption checks due to the strict positive skew
@@ -112,9 +174,10 @@ model_active_glmm <- glmer(wpli ~ load1 + load2 + (1|subject),
         # to make sure everything is positive, as this is a strict rule of GLMMs with log link function
 
 min(df$wpli[df$condition == "memory"], na.rm = TRUE) #figure out what is the most negative value in the dataset
-model_active_glmm <- glmer(wpli + 0.003 ~ load1 + load2 + (1|subject),  #add this value to all wpli's 
+model_active_glmm <- glmer(wpli + 0.003 ~ load1 + load2 (1|subject),  #add this value to all wpli's 
                          data = df[df$condition == "memory", ], 
                          family = Gamma(link = "log"))
+
 
         #check assumptions of this model:
 
@@ -156,7 +219,7 @@ summary(model_active_glmm)
 
 
 #=============================================================
-# STEP 4: hypothesis testing
+# STEP 5: hypothesis testing
 #=============================================================
 
 # test both hypothesis 1 and 2 at the same time with a bonferroni correction
@@ -165,7 +228,4 @@ library(multcomp)
   # define both hypotheses: 
 load_effects <- glht(model_active_glmm, linfct = c("load1 = 0", "load1 + load2 = 0"))
 summary(load_effects, test= adjusted("bonferroni")) #inspect the results
-
-
-
 
